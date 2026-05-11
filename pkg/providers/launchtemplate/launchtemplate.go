@@ -25,20 +25,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/awslabs/operatorpkg/option"
-	"github.com/awslabs/operatorpkg/serrors"
-	"go.uber.org/multierr"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/eks"
+	"github.com/awslabs/operatorpkg/option"
+	"github.com/awslabs/operatorpkg/serrors"
 	"github.com/mitchellh/hashstructure/v2"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
+	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
@@ -289,6 +288,7 @@ func (p *DefaultProvider) createLaunchTemplate(ctx context.Context, options *ami
 
 // generateNetworkInterfaces generates network interfaces for the launch template.
 func generateNetworkInterfaces(options *amifamily.LaunchTemplate, clusterIPFamily corev1.IPFamily) []ec2types.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest {
+	connTrackSpec := connectionTrackingSpec(options.ConnectionTracking)
 	if len(options.NetworkInterfaces) > 0 {
 		return lo.Map(options.NetworkInterfaces, func(networkInterface *v1.NetworkInterface, _ int) ec2types.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest {
 			// Assigning IPPrefixCounts or AssociatePublicIpAddress to EFA-only ENIs results in RunInstances failures w/ InvalidParameterValue
@@ -302,9 +302,10 @@ func generateNetworkInterfaces(options *amifamily.LaunchTemplate, clusterIPFamil
 				Groups:           lo.Map(options.SecurityGroups, func(s v1.SecurityGroup, _ int) string { return s.ID }),
 				// Instances launched with multiple pre-configured network interfaces cannot set AssociatePublicIPAddress to true. This is an EC2 limitation. However, this does not apply for instances
 				// with a single ENA network interface, and we should support those use cases. Launch failures with multiple enis as ENA should be considered user misconfiguration.
-				AssociatePublicIpAddress: options.AssociatePublicIPAddress,
-				PrimaryIpv6:              lo.Ternary(clusterIPFamily == corev1.IPv6Protocol && typeNotEFAOnly, lo.ToPtr(true), nil),
-				Ipv6AddressCount:         lo.Ternary(clusterIPFamily == corev1.IPv6Protocol && typeNotEFAOnly, lo.ToPtr(int32(1)), nil),
+				AssociatePublicIpAddress:        options.AssociatePublicIPAddress,
+				PrimaryIpv6:                     lo.Ternary(clusterIPFamily == corev1.IPv6Protocol && typeNotEFAOnly, lo.ToPtr(true), nil),
+				Ipv6AddressCount:                lo.Ternary(clusterIPFamily == corev1.IPv6Protocol && typeNotEFAOnly, lo.ToPtr(int32(1)), nil),
+				ConnectionTrackingSpecification: lo.Ternary(typeNotEFAOnly, connTrackSpec, nil),
 			}
 		})
 	}
@@ -322,9 +323,10 @@ func generateNetworkInterfaces(options *amifamily.LaunchTemplate, clusterIPFamil
 				Groups:          lo.Map(options.SecurityGroups, func(s v1.SecurityGroup, _ int) string { return s.ID }),
 				// Instances launched with multiple pre-configured network interfaces cannot set AssociatePublicIPAddress to true. This is an EC2 limitation. However, this does not apply for instances
 				// with a single EFA network interface, and we should support those use cases. Launch failures with multiple enis should be considered user misconfiguration.
-				AssociatePublicIpAddress: options.AssociatePublicIPAddress,
-				PrimaryIpv6:              lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(true), nil),
-				Ipv6AddressCount:         lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(int32(1)), nil),
+				AssociatePublicIpAddress:        options.AssociatePublicIPAddress,
+				PrimaryIpv6:                     lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(true), nil),
+				Ipv6AddressCount:                lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(int32(1)), nil),
+				ConnectionTrackingSpecification: connTrackSpec,
 			}
 		})
 	}
@@ -338,9 +340,21 @@ func generateNetworkInterfaces(options *amifamily.LaunchTemplate, clusterIPFamil
 			Groups: lo.Map(options.SecurityGroups, func(s v1.SecurityGroup, _ int) string {
 				return s.ID
 			}),
-			PrimaryIpv6:      lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(true), nil),
-			Ipv6AddressCount: lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(int32(1)), nil),
+			PrimaryIpv6:                     lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(true), nil),
+			Ipv6AddressCount:                lo.Ternary(clusterIPFamily == corev1.IPv6Protocol, lo.ToPtr(int32(1)), nil),
+			ConnectionTrackingSpecification: connTrackSpec,
 		},
+	}
+}
+
+func connectionTrackingSpec(ct *v1.ConnectionTracking) *ec2types.ConnectionTrackingSpecificationRequest {
+	if ct == nil || (ct.TCPEstablishedTimeout == nil && ct.UDPStreamTimeout == nil && ct.UDPTimeout == nil) {
+		return nil
+	}
+	return &ec2types.ConnectionTrackingSpecificationRequest{
+		TcpEstablishedTimeout: ct.TCPEstablishedTimeout,
+		UdpStreamTimeout:      ct.UDPStreamTimeout,
+		UdpTimeout:            ct.UDPTimeout,
 	}
 }
 
